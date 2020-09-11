@@ -60,23 +60,25 @@ func TestMatchingIdentities(t *testing.T) {
 	// populate the cache with FOO and BAR without SVIDS
 	foo := makeRegistrationEntry("FOO", "A")
 	bar := makeRegistrationEntry("BAR", "B")
+	empty := makeRegistrationEntry("EMPTY", "")
 	updateEntries := &UpdateEntries{
 		Bundles:             makeBundles(bundleV1),
-		RegistrationEntries: makeRegistrationEntries(foo, bar),
+		RegistrationEntries: makeRegistrationEntries(foo, bar, empty),
 	}
 	cache.UpdateEntries(updateEntries, nil)
 
-	identities := cache.MatchingIdentities(makeSelectors("A", "B"))
+	identities := cache.MatchingIdentities(makeSelectors("A", "B", ""))
 	assert.Len(t, identities, 0, "identities should not be returned that don't have SVIDs")
 
 	updateSVIDs := &UpdateSVIDs{
-		X509SVIDs: makeX509SVIDs(foo, bar),
+		X509SVIDs: makeX509SVIDs(foo, bar, empty),
 	}
 	cache.UpdateSVIDs(updateSVIDs)
 
-	identities = cache.MatchingIdentities(makeSelectors("A", "B"))
+	identities = cache.MatchingIdentities(makeSelectors("A", "B", ""))
 	assert.Equal(t, []Identity{
 		{Entry: bar},
+		{Entry: empty},
 		{Entry: foo},
 	}, identities)
 }
