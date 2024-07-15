@@ -89,6 +89,9 @@ type Config struct {
 	// PruneEventsOlderThan controls how long events can live before they are pruned
 	PruneEventsOlderThan time.Duration
 
+	// SQLTransactionTimeout controls how long to wait for an event before giving up
+	SQLTransactionTimeout time.Duration
+
 	AuditLogEnabled bool
 
 	// AdminIDs are a list of fixed IDs that when presented by a caller in an
@@ -96,18 +99,34 @@ type Config struct {
 	AdminIDs []spiffeid.ID
 
 	BundleManager *bundle_client.Manager
+
+	// UseLegacyDownstreamX509CATTL, if true, the downstream X509CAs will use
+	// the legacy TTL calculation ( e.g. prefer downstream workload entry TTL,
+	// then fall back to the default workload X509-SVID TTL) v.s. the new TTL
+	// calculation (prefer the TTL passed by the downstream caller, then fall
+	// back to the default X509 CA TTL).
+	UseLegacyDownstreamX509CATTL bool
 }
 
-func (c *Config) maybeMakeBundleEndpointServer() Server {
+func (c *Config) maybeMakeBundleEndpointServer() (Server, func(context.Context) error) {
 	if c.BundleEndpoint.Address == nil {
-		return nil
+		return nil, nil
 	}
 	c.Log.WithField("addr", c.BundleEndpoint.Address).WithField("refresh_hint", c.BundleEndpoint.RefreshHint).Info("Serving bundle endpoint")
 
+	var certificateReloadTask func(context.Context) error
 	var serverAuth bundle.ServerAuth
-	if c.BundleEndpoint.ACME != nil {
+	switch {
+	case c.BundleEndpoint.ACME != nil:
 		serverAuth = bundle.ACMEAuth(c.Log.WithField(telemetry.SubsystemName, "bundle_acme"), c.Catalog.GetKeyManager(), *c.BundleEndpoint.ACME)
-	} else {
+	case c.BundleEndpoint.DiskCertManager != nil:
+		serverAuth = c.BundleEndpoint.DiskCertManager
+		// Start watching for file changes
+		certificateReloadTask = func(ctx context.Context) error {
+			c.BundleEndpoint.DiskCertManager.WatchFileChanges(ctx)
+			return nil
+		}
+	default:
 		serverAuth = bundle.SPIFFEAuth(func() ([]*x509.Certificate, crypto.PrivateKey, error) {
 			state := c.SVIDObserver.State()
 			return state.SVID, state.Key, nil
@@ -130,7 +149,7 @@ func (c *Config) maybeMakeBundleEndpointServer() Server {
 		}),
 		RefreshHint: c.BundleEndpoint.RefreshHint,
 		ServerAuth:  serverAuth,
-	})
+	}), certificateReloadTask
 }
 
 func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServers {
@@ -170,10 +189,11 @@ func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServ
 			Log: c.RootLog,
 		}),
 		SVIDServer: svidv1.New(svidv1.Config{
-			TrustDomain:  c.TrustDomain,
-			EntryFetcher: entryFetcher,
-			ServerCA:     c.ServerCA,
-			DataStore:    ds,
+			TrustDomain:                  c.TrustDomain,
+			EntryFetcher:                 entryFetcher,
+			ServerCA:                     c.ServerCA,
+			DataStore:                    ds,
+			UseLegacyDownstreamX509CATTL: c.UseLegacyDownstreamX509CATTL,
 		}),
 		TrustDomainServer: trustdomainv1.New(trustdomainv1.Config{
 			TrustDomain:     c.TrustDomain,

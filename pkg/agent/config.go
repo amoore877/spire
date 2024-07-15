@@ -97,9 +97,6 @@ type Config struct {
 
 	// AvailabilityTarget controls how frequently rotate SVIDs
 	AvailabilityTarget time.Duration
-
-	// Deprecated config option to disable reattest to renew functionality
-	DisableReattestToRenew bool
 }
 
 func New(c *Config) *Agent {

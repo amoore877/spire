@@ -3,7 +3,6 @@ package endpoints
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/andres-erbsen/clock"
@@ -13,8 +12,6 @@ import (
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/authorizedentries"
 	"github.com/spiffe/spire/pkg/server/datastore"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 var _ api.AuthorizedEntryFetcher = (*AuthorizedEntryFetcherWithEventsBasedCache)(nil)
@@ -22,33 +19,42 @@ var _ api.AuthorizedEntryFetcher = (*AuthorizedEntryFetcherWithEventsBasedCache)
 const buildCachePageSize = 10000
 
 type AuthorizedEntryFetcherWithEventsBasedCache struct {
-	cache                        *authorizedentries.Cache
-	clk                          clock.Clock
-	log                          logrus.FieldLogger
-	ds                           datastore.DataStore
-	cacheReloadInterval          time.Duration
-	pruneEventsOlderThan         time.Duration
-	lastRegistrationEntryEventID uint
-	lastAttestedNodeEventID      uint
+	cache *authorizedentries.Cache
+	clk   clock.Clock
+	log   logrus.FieldLogger
+	ds    datastore.DataStore
+
+	cacheReloadInterval   time.Duration
+	pruneEventsOlderThan  time.Duration
+	sqlTransactionTimeout time.Duration
+
+	registrationEntries eventsBasedCache
+	attestedNodes       eventsBasedCache
 }
 
-func NewAuthorizedEntryFetcherWithEventsBasedCache(ctx context.Context, log logrus.FieldLogger, clk clock.Clock, ds datastore.DataStore, cacheReloadInterval, pruneEventsOlderThan time.Duration) (*AuthorizedEntryFetcherWithEventsBasedCache, error) {
+type eventsBasedCache interface {
+	updateCache(ctx context.Context) error
+	pruneMissedEvents(sqlTransactionTimeout time.Duration)
+}
+
+func NewAuthorizedEntryFetcherWithEventsBasedCache(ctx context.Context, log logrus.FieldLogger, clk clock.Clock, ds datastore.DataStore, cacheReloadInterval, pruneEventsOlderThan, sqlTransactionTimeout time.Duration) (*AuthorizedEntryFetcherWithEventsBasedCache, error) {
 	log.Info("Building event-based in-memory entry cache")
-	cache, lastRegistrationEntryEventID, lastAttestedNodeEventID, err := buildCache(ctx, ds, clk)
+	cache, registrationEntries, attestedNodes, err := buildCache(ctx, log, ds, clk)
 	if err != nil {
 		return nil, err
 	}
 	log.Info("Completed building event-based in-memory entry cache")
 
 	return &AuthorizedEntryFetcherWithEventsBasedCache{
-		cache:                        cache,
-		clk:                          clk,
-		log:                          log,
-		ds:                           ds,
-		cacheReloadInterval:          cacheReloadInterval,
-		pruneEventsOlderThan:         pruneEventsOlderThan,
-		lastRegistrationEntryEventID: lastRegistrationEntryEventID,
-		lastAttestedNodeEventID:      lastAttestedNodeEventID,
+		cache:                 cache,
+		clk:                   clk,
+		log:                   log,
+		ds:                    ds,
+		cacheReloadInterval:   cacheReloadInterval,
+		pruneEventsOlderThan:  pruneEventsOlderThan,
+		sqlTransactionTimeout: sqlTransactionTimeout,
+		registrationEntries:   registrationEntries,
+		attestedNodes:         attestedNodes,
 	}, nil
 }
 
@@ -94,171 +100,31 @@ func (a *AuthorizedEntryFetcherWithEventsBasedCache) pruneEvents(ctx context.Con
 	pruneRegistrationEntriesEventsErr := a.ds.PruneRegistrationEntriesEvents(ctx, olderThan)
 	pruneAttestedNodesEventsErr := a.ds.PruneAttestedNodesEvents(ctx, olderThan)
 
+	a.registrationEntries.pruneMissedEvents(a.sqlTransactionTimeout)
+	a.attestedNodes.pruneMissedEvents(a.sqlTransactionTimeout)
+
 	return errors.Join(pruneRegistrationEntriesEventsErr, pruneAttestedNodesEventsErr)
 }
 
 func (a *AuthorizedEntryFetcherWithEventsBasedCache) updateCache(ctx context.Context) error {
-	updateRegistrationEntriesCacheErr := a.updateRegistrationEntriesCache(ctx)
-	updateAttestedNodesCacheErr := a.updateAttestedNodesCache(ctx)
+	updateRegistrationEntriesCacheErr := a.registrationEntries.updateCache(ctx)
+	updateAttestedNodesCacheErr := a.attestedNodes.updateCache(ctx)
 
 	return errors.Join(updateRegistrationEntriesCacheErr, updateAttestedNodesCacheErr)
 }
 
-func (a *AuthorizedEntryFetcherWithEventsBasedCache) updateRegistrationEntriesCache(ctx context.Context) error {
-	req := &datastore.ListRegistrationEntriesEventsRequest{
-		GreaterThanEventID: a.lastRegistrationEntryEventID,
-	}
-	resp, err := a.ds.ListRegistrationEntriesEvents(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	seenMap := map[string]struct{}{}
-	for _, event := range resp.Events {
-		// Skip fetching entries we've already fetched this call
-		if _, seen := seenMap[event.EntryID]; seen {
-			a.lastRegistrationEntryEventID = event.EventID
-			continue
-		}
-		seenMap[event.EntryID] = struct{}{}
-
-		commonEntry, err := a.ds.FetchRegistrationEntry(ctx, event.EntryID)
-		if err != nil {
-			return err
-		}
-		a.lastRegistrationEntryEventID = event.EventID
-
-		entry, err := api.RegistrationEntryToProto(commonEntry)
-		if err != nil {
-			a.cache.RemoveEntry(event.EntryID)
-			continue
-		}
-
-		a.cache.UpdateEntry(entry)
-	}
-
-	return nil
-}
-
-func (a *AuthorizedEntryFetcherWithEventsBasedCache) updateAttestedNodesCache(ctx context.Context) error {
-	req := &datastore.ListAttestedNodesEventsRequest{
-		GreaterThanEventID: a.lastAttestedNodeEventID,
-	}
-	resp, err := a.ds.ListAttestedNodesEvents(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	seenMap := map[string]struct{}{}
-	for _, event := range resp.Events {
-		// Skip fetching entries we've already fetched this call
-		if _, seen := seenMap[event.SpiffeID]; seen {
-			a.lastAttestedNodeEventID = event.EventID
-			continue
-		}
-		seenMap[event.SpiffeID] = struct{}{}
-
-		node, err := a.ds.FetchAttestedNode(ctx, event.SpiffeID)
-		if err != nil {
-			return err
-		}
-
-		// Node was deleted
-		if node == nil {
-			a.cache.RemoveAgent(event.SpiffeID)
-			a.lastAttestedNodeEventID = event.EventID
-			continue
-		}
-
-		selectors, err := a.ds.GetNodeSelectors(ctx, event.SpiffeID, datastore.RequireCurrent)
-		if err != nil {
-			return err
-		}
-		node.Selectors = selectors
-
-		agentExpiresAt := time.Unix(node.CertNotAfter, 0)
-		a.cache.UpdateAgent(node.SpiffeId, agentExpiresAt, api.ProtoFromSelectors(node.Selectors))
-		a.lastAttestedNodeEventID = event.EventID
-	}
-
-	return nil
-}
-
-func buildCache(ctx context.Context, ds datastore.DataStore, clk clock.Clock) (*authorizedentries.Cache, uint, uint, error) {
+func buildCache(ctx context.Context, log logrus.FieldLogger, ds datastore.DataStore, clk clock.Clock) (*authorizedentries.Cache, *registrationEntries, *attestedNodes, error) {
 	cache := authorizedentries.NewCache(clk)
 
-	lastRegistrationEntryEventID, err := buildRegistrationEntriesCache(ctx, ds, cache, buildCachePageSize)
+	registrationEntries, err := buildRegistrationEntriesCache(ctx, log, ds, clk, cache, buildCachePageSize)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 
-	lastAttestedNodeEventID, err := buildAttestedNodesCache(ctx, ds, clk, cache)
+	attestedNodes, err := buildAttestedNodesCache(ctx, log, ds, clk, cache)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 
-	return cache, lastRegistrationEntryEventID, lastAttestedNodeEventID, nil
-}
-
-// buildRegistrationEntriesCache Fetches all registration entries and adds them to the cache
-func buildRegistrationEntriesCache(ctx context.Context, ds datastore.DataStore, cache *authorizedentries.Cache, pageSize int32) (uint, error) {
-	lastEventID, err := ds.GetLatestRegistrationEntryEventID(ctx)
-	if err != nil && status.Code(err) != codes.NotFound {
-		return 0, fmt.Errorf("failed to get latest registration entry event id: %w", err)
-	}
-
-	var token string
-	for {
-		resp, err := ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{
-			DataConsistency: datastore.RequireCurrent, // preliminary loading should not be done via read-replicas
-			Pagination: &datastore.Pagination{
-				Token:    token,
-				PageSize: pageSize,
-			},
-		})
-		if err != nil {
-			return 0, fmt.Errorf("failed to list registration entries: %w", err)
-		}
-
-		token = resp.Pagination.Token
-		if token == "" {
-			break
-		}
-
-		entries, err := api.RegistrationEntriesToProto(resp.Entries)
-		if err != nil {
-			return 0, fmt.Errorf("failed to convert registration entries: %w", err)
-		}
-
-		for _, entry := range entries {
-			cache.UpdateEntry(entry)
-		}
-	}
-
-	return lastEventID, nil
-}
-
-// buildAttestedNodesCache Fetches all attested nodes and adds the unexpired ones to the cache
-func buildAttestedNodesCache(ctx context.Context, ds datastore.DataStore, clk clock.Clock, cache *authorizedentries.Cache) (uint, error) {
-	lastEventID, err := ds.GetLatestAttestedNodeEventID(ctx)
-	if err != nil && status.Code(err) != codes.NotFound {
-		return 0, fmt.Errorf("failed to get latest attested node event id: %w", err)
-	}
-
-	resp, err := ds.ListAttestedNodes(ctx, &datastore.ListAttestedNodesRequest{
-		FetchSelectors: true,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to list attested nodes: %w", err)
-	}
-
-	for _, node := range resp.Nodes {
-		agentExpiresAt := time.Unix(node.CertNotAfter, 0)
-		if agentExpiresAt.Before(clk.Now()) {
-			continue
-		}
-		cache.UpdateAgent(node.SpiffeId, agentExpiresAt, api.ProtoFromSelectors(node.Selectors))
-	}
-
-	return lastEventID, nil
+	return cache, registrationEntries, attestedNodes, nil
 }

@@ -104,6 +104,9 @@ type Config struct {
 	// PruneEventsOlderThan controls how long events can live before they are pruned
 	PruneEventsOlderThan time.Duration
 
+	// SQLTransactionTimeout controls how long to wait for an event before giving up
+	SQLTransactionTimeout time.Duration
+
 	// AuthPolicyEngineConfig determines the config for authz policy
 	AuthOpaPolicyEngineConfig *authpolicy.OpaEngineConfig
 
@@ -111,8 +114,12 @@ type Config struct {
 	// X509-SVID, are granted admin rights.
 	AdminIDs []spiffeid.ID
 
-	// Temporary flag to allow disabling the inclusion of serial number in X509 CAs Subject field
-	ExcludeSNFromCASubject bool
+	// UseLegacyDownstreamX509CATTL, if true, the downstream X509CAs will use
+	// the legacy TTL calculation (e.g. prefer downstream workload entry TTL,
+	// then fall back to the default workload X509-SVID TTL) v.s. the new TTL
+	// calculation (prefer the TTL passed by the downstream caller, then fall
+	// back to the default X509 CA TTL).
+	UseLegacyDownstreamX509CATTL bool
 }
 
 type ExperimentalConfig struct {
